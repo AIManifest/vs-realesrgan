@@ -292,7 +292,9 @@ def realesrgan(
         backend = Backend.Eager(module=module)
 
     clip_name = os.path.splitext(clip_path)[0]
-    output_path = os.path.join(os.path.dirname(clip_path), clip_name + "_output_clip0.mp4")
+    clip_dir = os.path.dirname(clip_path)
+    name_length = len([f for f in os.listdir(clip_dir) if os.path.isfile(clip_path) and clip_name in f])
+    output_path = os.path.join(os.path.dirname(clip_path), clip_name + f"{model_name}_{name_length:03d}_output_clip.mp4")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (width * scale, height * scale))
