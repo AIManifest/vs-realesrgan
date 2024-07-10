@@ -10,7 +10,7 @@ from threading import Lock
 import numpy as np
 import torch
 import torch.nn.functional as F
-import vapoursynth as vs
+# import vapoursynth as vs
 
 from .rrdbnet_arch import RRDBNet
 from .srvgg_arch import SRVGGNetCompact
