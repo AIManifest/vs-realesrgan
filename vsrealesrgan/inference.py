@@ -20,6 +20,8 @@ import skvideo.io
 import _thread
 from queue import Queue, Empty
 from PIL import Image
+from spandrel import ModelLoader
+from .SPAN import SPAN
 
 __version__ = "5.0.0"
 
@@ -72,12 +74,6 @@ def numpy_to_pil_display(np_array):
     # Convert the NumPy array to a PIL Image
     pil_image = Image.fromarray(np_array.astype('uint8'))
 
-    # Display the image using ipywidgets
-    # img_widget = widgets.Image(
-    #     value=pil_image.tobytes(),
-    #     format='png',
-    #     width="256px"
-    # )
     display(pil_image)
 
     return pil_image
@@ -85,26 +81,29 @@ def numpy_to_pil_display(np_array):
 
 @torch.inference_mode()
 def realesrgan(
-    clip_path: str,
-    output_path: str,
-    device_index: int = 0,
-    num_streams: int = 1,
-    model: RealESRGANModel = RealESRGANModel.ESRGAN_4x_UltraMix_Balanced,
-    model_path: str | None = None,
-    denoise_strength: float = 0.5,
-    tile: list[int] = [0, 0],
-    tile_pad: int = 8,
-    trt: bool = False,
-    trt_debug: bool = False,
-    trt_workspace_size: int = 0,
-    trt_int8: bool = False,
-    trt_int8_sample_step: int = 72,
-    trt_int8_batch_size: int = 1,
-    trt_cache_dir: str = model_dir,
-) -> None:
-    # model = RealESRGANModel.RealESRGAN_x4plus_anime_6B
+        clip_path: str,
+        output_path: str,
+        device_index: int = 0,
+        num_streams: int = 1,
+        model: RealESRGANModel = RealESRGANModel.OpenProteus_Compact_2x,
+        model_path: str | None = None,
+        denoise_strength: float = 0.5,
+        tile: list[int] = [0, 0],
+        tile_pad: int = 8,
+        trt: bool = False,
+        trt_debug: bool = False,
+        trt_workspace_size: int = 0,
+        trt_int8: bool = False,
+        trt_int8_sample_step: int = 72,
+        trt_int8_batch_size: int = 1,
+        trt_cache_dir: str = model_dir,
+        use_fp16: bool = False,
+        custom_model: bool = False
+    ) -> None:
+
     torch.set_float32_matmul_precision("high")
-    print(model)
+
+    # Assert Settings
     if not os.path.isfile(clip_path):
         raise FileNotFoundError(f"Input video file '{clip_path}' not found")
 
@@ -114,8 +113,8 @@ def realesrgan(
     if num_streams < 1:
         raise ValueError("realesrgan: num_streams must be at least 1")
 
-    # if model not in RealESRGANModel:
-    #     raise ValueError("realesrgan: model must be one of the members in RealESRGANModel")
+    if model not in RealESRGANModel:
+        raise ValueError("realesrgan: model must be one of the members in RealESRGANModel")
 
     if denoise_strength < 0 or denoise_strength > 1:
         raise ValueError("realesrgan: denoise_strength must be between 0.0 and 1.0 (inclusive)")
@@ -126,6 +125,7 @@ def realesrgan(
     if trt and trt_int8:
         raise ValueError("realesrgan: INT8 mode not implemented in this conversion")
 
+    #Capture Video Information
     cap = cv2.VideoCapture(clip_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video file '{clip_path}'")
@@ -134,13 +134,21 @@ def realesrgan(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    fp16 = False
+    #Set Dtype
+    fp16 = use_fp16
+    if fp16:
+        print("***Overriding tensors to fp16***")
+        
     dtype = torch.half if fp16 else torch.float
 
+    #Set Device
     device = torch.device("cuda", device_index)
 
+    #Set Streams
     stream = [torch.cuda.Stream(device=device) for _ in range(num_streams)]
     stream_lock = [Lock() for _ in range(num_streams)]
+
+    #Set Model Path
     if model_path is None:
         print(f'Using {model} for inference')
         if model == RealESRGANModel.ESRGAN_4x_UltraMix_Balanced:
@@ -150,19 +158,23 @@ def realesrgan(
             model_name = f"{RealESRGANModel(model).name}.pth"
 
         model_path = os.path.join(model_dir, model_name)
+        print(f"Using {model_path}")
     else:
         print(f'Using {model_path} for inference')
         model_path = os.path.realpath(model_path)
         model_name = os.path.basename(model_path)
         print(f'Using {model_path} for inference')
         print(f'Using {model_name} for inference')
-    
+
+    #Load State Dict
     state_dict = torch.load(model_path, weights_only=True, map_location=device)
+    
     if "params_ema" in state_dict:
         state_dict = state_dict["params_ema"]
     elif "params" in state_dict:
         state_dict = state_dict["params"]
 
+    #Model Set Up
     if model == RealESRGANModel.realesr_general_x4v3 and denoise_strength != 1:
         wdn_model_path = model_path.replace("realesr_general_x4v3", "realesr_general_wdn_x4v3")
         dni_weight = [denoise_strength, 1 - denoise_strength]
@@ -177,6 +189,7 @@ def realesrgan(
             state_dict[k] = dni_weight[0] * v + dni_weight[1] * net_b[k]
 
     if "conv_first.weight" in state_dict:
+        print("RRDBNet")
         num_feat = state_dict["conv_first.weight"].shape[0]
         num_block = int(list(state_dict)[-11].split(".")[1]) + 1
         num_grow_ch = state_dict["body.0.rdb1.conv1.weight"].shape[0]
@@ -190,22 +203,32 @@ def realesrgan(
                 scale = 4
 
         module = RRDBNet(3, 3, num_feat=num_feat, num_block=num_block, num_grow_ch=num_grow_ch, scale=scale)
-    elif model == RealESRGANModel.ESRGAN_4x_UltraMix_Balanced:
-        print("Loading UltraMix")
-        module = ESRGAN(state_dict)
         scale = 4
+        
+    elif custom_model:
+        print("ESRGAN/SPAN")
+        if "UltraMix" in model_path:
+            print("Loading UltraMix")
+            module = ESRGAN(state_dict)
+        elif "ClearRealityV1" in model_path:
+            print("Loading ClearReality")
+            # module = ModelLoader().load_from_file(model_path)
+            # module = span.load_state_dict(state_dict).eval().cuda()
+            module = SPAN(3, 3, upscale=4, feature_channels=48)
+            scale = 4
     else:
+        print("SRVGGNetCompact")
         num_feat = state_dict["body.0.weight"].shape[0]
         num_conv = int(list(state_dict)[-1].split(".")[1]) // 2 - 1
         scale = math.isqrt(state_dict[list(state_dict)[-1]].shape[0] // 3)
 
         module = SRVGGNetCompact(3, 3, num_feat=num_feat, num_conv=num_conv, upscale=scale, act_type="prelu")
 
-    fp16 = False
-    
+    #Set Model Dtype
     if fp16:
         module.half()
 
+    #Set Padding Vars
     match scale:
         case 1:
             modulo = 4
@@ -221,17 +244,23 @@ def realesrgan(
         pad_w = math.ceil(width / modulo) * modulo
         pad_h = math.ceil(height / modulo) * modulo
 
+    #Load State Dict to Model
     module.load_state_dict(state_dict, strict=True)
+
+    #ESRGAN, 
     if model == RealESRGANModel.ESRGAN_4x_UltraMix_Balanced:
         print('removing grad')
         for k, v in module.named_parameters():
             v.requires_grad = False
-    module = module.eval().cuda()
-    
+
+    #Initiate Model to Eval and Send to Cuda
+    module = module.cuda().eval()
+
+    #TRT Conversion
     if trt:
         import torch_tensorrt
-        import tensorrt
         from torch_tensorrt import Input
+        import tensorrt
         
         dtype = torch.float16 if fp16 else torch.float
         device = torch.device(f"cuda:{device_index}")
@@ -240,6 +269,8 @@ def realesrgan(
                 os.path.realpath(trt_cache_dir),
                 (
                     f"{model_name}"
+                    + f"_{'trt' if trt else ''}"
+                    + f"_{'custom_model' if custom_model else ''}"
                     + f"_{pad_w}x{pad_h}"
                     + f"_{'int8' if trt_int8 else 'fp16' if fp16 else 'fp32'}"
                     + (f"_denoise-{denoise_strength}" if model == RealESRGANModel.realesr_general_x4v3 else "")
@@ -291,16 +322,19 @@ def realesrgan(
     else:
         backend = Backend.Eager(module=module)
 
+    #Output Video Settings
     clip_name = os.path.splitext(clip_path)[0]
     clip_dir = os.path.dirname(clip_path)
     name_length = len([f for f in os.listdir(clip_dir) if os.path.isfile(clip_path) and clip_name in f])
-    output_path = os.path.join(os.path.dirname(clip_path), clip_name + f"{model_name}_{name_length:03d}_output_clip.mp4")
+    output_path = os.path.join(os.path.dirname(clip_path), clip_name + f"{model_name}_{name_length:03d}_output_clip.mp4") if output_path is None else output_path
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (width * scale, height * scale))
 
+    #Create Frame Reader
     videogen = skvideo.io.vreader(clip_path)
 
+    #Create Buffers
     use_png = False
     def clear_write_buffer(use_png, write_buffer):
         cnt = 0
@@ -334,19 +368,17 @@ def realesrgan(
     _thread.start_new_thread(clear_write_buffer, (use_montage, write_buffer))
 
     pbar = tqdm(total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), unit="frame")
+    cap.release()
 
     frame_idx = 0
-    # while cap.isOpened():
     start_time = time.time()
+
+    #Inference Loop
     while True:
         frame = read_buffer.get()
         if frame is None:
             break
-        # ret, frame = cap.read()
-        # if not ret:
-        #     break
 
-        # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = torch.from_numpy(frame).float().div(255.0).permute(2, 0, 1).unsqueeze(0).to(device)
 
         i = frame_idx % num_streams
@@ -357,23 +389,19 @@ def realesrgan(
             with torch.no_grad():
                 output = module(frame)
             output = output.squeeze().permute(1, 2, 0).mul(255.0).clamp(0, 255).byte().cpu().numpy()
-            # numpy_to_pil_display(output)
-            
-            # output = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
-            # output = np.asarray((((output * 255.).byte().cpu().numpy().astype(np.uint8).transpose(1, 2, 0))))
-            # writer.write(output)
             # cv2.imwrite(f"/workspace/tmpdir/frame_{frame_idx:09d}.png", output)
         write_buffer.put(output)
         stream_lock[i].release()
 
         pbar.update(1)
         frame_idx += 1
+
+    write_buffer.put(frame)
         
     while(not write_buffer.empty()):
         time.sleep(0.1)
 
     pbar.close()
-    cap.release()
     writer.release()
 
     print(f"Video Upscaling completed in {time.time()-start_time:.2f}")
