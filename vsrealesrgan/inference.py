@@ -207,10 +207,11 @@ def realesrgan(
         
     elif custom_model:
         print("ESRGAN/SPAN")
-        if "UltraMix" in model_path:
+        if "UltraMix" in model_path or "model.0.weight" in state_dict:
             print("Loading UltraMix")
             module = ESRGAN(state_dict)
-        elif "ClearRealityV1" in model_path:
+            scale = 4
+        elif "ClearRealityV1" in model_path or "conv_1.sk.weight" in state_dict:
             print("Loading ClearReality")
             # module = ModelLoader().load_from_file(model_path)
             # module = span.load_state_dict(state_dict).eval().cuda()
@@ -364,8 +365,8 @@ def realesrgan(
 
     write_buffer = Queue(maxsize=500)
     read_buffer = Queue(maxsize=500)
-    _thread.start_new_thread(build_read_buffer, (use_png, read_buffer, videogen))
-    _thread.start_new_thread(clear_write_buffer, (use_montage, write_buffer))
+    _thread.start_new_thread(build_read_buffer, (use_montage, read_buffer, videogen))
+    _thread.start_new_thread(clear_write_buffer, (use_png, write_buffer))
 
     pbar = tqdm(total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), unit="frame")
     cap.release()
@@ -377,6 +378,7 @@ def realesrgan(
     while True:
         frame = read_buffer.get()
         if frame is None:
+            print("frame is none")
             break
 
         frame = torch.from_numpy(frame).float().div(255.0).permute(2, 0, 1).unsqueeze(0).to(device)
@@ -405,3 +407,5 @@ def realesrgan(
     writer.release()
 
     print(f"Video Upscaling completed in {time.time()-start_time:.2f}")
+
+    return output_path
