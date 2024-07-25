@@ -85,7 +85,7 @@ def realesrgan(
         output_path: str,
         device_index: int = 0,
         num_streams: int = 1,
-        model: RealESRGANModel = RealESRGANModel.OpenProteus_Compact_2x,
+        model: RealESRGANModel = RealESRGANModel.realesr_general_x4v3,
         model_path: str | None = None,
         denoise_strength: float = 0.5,
         tile: list[int] = [0, 0],
@@ -100,7 +100,6 @@ def realesrgan(
         use_fp16: bool = False,
         custom_model: bool = False
     ) -> None:
-
     torch.set_float32_matmul_precision("high")
 
     # Assert Settings
@@ -175,35 +174,41 @@ def realesrgan(
         state_dict = state_dict["params"]
 
     #Model Set Up
-    if model == RealESRGANModel.realesr_general_x4v3 and denoise_strength != 1:
-        wdn_model_path = model_path.replace("realesr_general_x4v3", "realesr_general_wdn_x4v3")
-        dni_weight = [denoise_strength, 1 - denoise_strength]
-
-        net_b = torch.load(wdn_model_path, weights_only=True, map_location=device)
-        if "params_ema" in net_b:
-            net_b = net_b["params_ema"]
-        elif "params" in net_b:
-            net_b = net_b["params"]
-
-        for k, v in state_dict.items():
-            state_dict[k] = dni_weight[0] * v + dni_weight[1] * net_b[k]
-
-    if "conv_first.weight" in state_dict:
-        print("RRDBNet")
-        num_feat = state_dict["conv_first.weight"].shape[0]
-        num_block = int(list(state_dict)[-11].split(".")[1]) + 1
-        num_grow_ch = state_dict["body.0.rdb1.conv1.weight"].shape[0]
-
-        match state_dict["conv_first.weight"].shape[1]:
-            case 48:
-                scale = 1
-            case 12:
-                scale = 2
-            case _:
-                scale = 4
-
-        module = RRDBNet(3, 3, num_feat=num_feat, num_block=num_block, num_grow_ch=num_grow_ch, scale=scale)
-        scale = 4
+    if not custom_model:    
+        if model == RealESRGANModel.realesr_general_x4v3 and denoise_strength != 1:
+            wdn_model_path = model_path.replace("realesr_general_x4v3", "realesr_general_wdn_x4v3")
+            dni_weight = [denoise_strength, 1 - denoise_strength]
+    
+            net_b = torch.load(wdn_model_path, map_location=device, weights_only=True)
+            if "params_ema" in net_b:
+                net_b = net_b["params_ema"]
+            elif "params" in net_b:
+                net_b = net_b["params"]
+    
+            for k, v in state_dict.items():
+                state_dict[k] = dni_weight[0] * v + dni_weight[1] * net_b[k]
+    
+        if "conv_first.weight" in state_dict:
+            num_feat = state_dict["conv_first.weight"].shape[0]
+            num_block = int(list(state_dict)[-11].split(".")[1]) + 1
+            num_grow_ch = state_dict["body.0.rdb1.conv1.weight"].shape[0]
+    
+            match state_dict["conv_first.weight"].shape[1]:
+                case 48:
+                    scale = 1
+                case 12:
+                    scale = 2
+                case _:
+                    scale = 4
+    
+            module = RRDBNet(3, 3, num_feat=num_feat, num_block=num_block, num_grow_ch=num_grow_ch, scale=scale)
+        else:
+            num_feat = state_dict["body.0.weight"].shape[0]
+            num_conv = int(list(state_dict)[-1].split(".")[1]) // 2 - 1
+            scale = math.isqrt(state_dict[list(state_dict)[-1]].shape[0] // 3)
+    
+    
+            module = SRVGGNetCompact(3, 3, num_feat=num_feat, num_conv=num_conv, upscale=scale, act_type="prelu")
         
     elif custom_model:
         print("ESRGAN/SPAN")
@@ -217,13 +222,12 @@ def realesrgan(
             # module = span.load_state_dict(state_dict).eval().cuda()
             module = SPAN(3, 3, upscale=4, feature_channels=48)
             scale = 4
-    else:
-        print("SRVGGNetCompact")
-        num_feat = state_dict["body.0.weight"].shape[0]
-        num_conv = int(list(state_dict)[-1].split(".")[1]) // 2 - 1
-        scale = math.isqrt(state_dict[list(state_dict)[-1]].shape[0] // 3)
+        if "conv_first.weight" in state_dict:
+            print("Using Spandrel, turning off TRT")
+            module = ModelLoader().load_from_file(model_path)
+            scale = 1
+            trt=False
 
-        module = SRVGGNetCompact(3, 3, num_feat=num_feat, num_conv=num_conv, upscale=scale, act_type="prelu")
 
     #Set Model Dtype
     if fp16:
@@ -256,6 +260,18 @@ def realesrgan(
 
     #Initiate Model to Eval and Send to Cuda
     module = module.cuda().eval()
+
+    use_denoiser_model = False
+    if use_denoiser_model:
+        from spandrel import ModelLoader
+        import spandrel_extra_arches
+        spandrel_extra_arches.install()
+
+        denoise_model = ModelLoader().load_from_file(r"/workspace/1x_ArtClarity.pth")
+        if fp16:
+            denoise_model.half()
+        denoise_model.eval().cuda()
+        print("Successfully Loaded Denoiser Model")
 
     #TRT Conversion
     if trt:
@@ -327,7 +343,7 @@ def realesrgan(
     clip_name = os.path.splitext(clip_path)[0]
     clip_dir = os.path.dirname(clip_path)
     name_length = len([f for f in os.listdir(clip_dir) if os.path.isfile(clip_path) and clip_name in f])
-    output_path = os.path.join(os.path.dirname(clip_path), clip_name + f"{model_name}_{name_length:03d}_output_clip.mp4") if output_path is None else output_path
+    output_path = os.path.join(os.path.dirname(clip_path), clip_name + f"{model_name}_{name_length+1:03d}_output_clip.mp4") if output_path is None else output_path
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (width * scale, height * scale))
@@ -382,6 +398,8 @@ def realesrgan(
             break
 
         frame = torch.from_numpy(frame).float().div(255.0).permute(2, 0, 1).unsqueeze(0).to(device)
+        if fp16:
+            frame = frame.half()
 
         i = frame_idx % num_streams
         stream_lock[i].acquire()
@@ -390,6 +408,8 @@ def realesrgan(
         with torch.cuda.stream(stream[i]):
             with torch.no_grad():
                 output = module(frame)
+                if use_denoiser_model:
+                    output = denoise_model(output)
             output = output.squeeze().permute(1, 2, 0).mul(255.0).clamp(0, 255).byte().cpu().numpy()
             # cv2.imwrite(f"/workspace/tmpdir/frame_{frame_idx:09d}.png", output)
         write_buffer.put(output)
@@ -398,7 +418,7 @@ def realesrgan(
         pbar.update(1)
         frame_idx += 1
 
-    write_buffer.put(frame)
+    write_buffer.put(None)
         
     while(not write_buffer.empty()):
         time.sleep(0.1)
