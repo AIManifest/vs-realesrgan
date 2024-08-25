@@ -21,7 +21,11 @@ import _thread
 from queue import Queue, Empty
 from PIL import Image
 from spandrel import ModelLoader
-from .SPAN import SPAN
+import spandrel_extra_arches
+# from .SPAN import SPAN
+# from spandrel.architectures.SPAN import SPAN
+from .spandrel_SPAN import SPAN
+from spandrel.util import KeyCondition, get_scale_and_output_channels
 
 __version__ = "5.0.0"
 
@@ -112,8 +116,8 @@ def realesrgan(
     if num_streams < 1:
         raise ValueError("realesrgan: num_streams must be at least 1")
 
-    if model not in RealESRGANModel:
-        raise ValueError("realesrgan: model must be one of the members in RealESRGANModel")
+    # if model not in RealESRGANModel:
+    #     raise ValueError("realesrgan: model must be one of the members in RealESRGANModel")
 
     if denoise_strength < 0 or denoise_strength > 1:
         raise ValueError("realesrgan: denoise_strength must be between 0.0 and 1.0 (inclusive)")
@@ -220,7 +224,41 @@ def realesrgan(
             print("Loading ClearReality")
             # module = ModelLoader().load_from_file(model_path)
             # module = span.load_state_dict(state_dict).eval().cuda()
-            module = SPAN(3, 3, upscale=4, feature_channels=48)
+            # module = SPAN(3, 3, upscale=4, feature_channels=48)
+            num_in_ch = 3
+            num_out_ch = 3
+            feature_channels = 48
+            upscale = 4
+            bias = True  # unused internally
+            norm = True
+            img_range = 255.0  # cannot be deduced from state_dict
+            rgb_mean = (0.4488, 0.4371, 0.4040)  # cannot be deduced from state_dict
+    
+            num_in_ch = state_dict["conv_1.sk.weight"].shape[1]
+            feature_channels = state_dict["conv_1.sk.weight"].shape[0]
+    
+            # pixelshuffel shenanigans
+            upscale, num_out_ch = get_scale_and_output_channels(
+                state_dict["upsampler.0.weight"].shape[0],
+                num_in_ch,
+            )
+    
+            # norm
+            if "no_norm" in state_dict:
+                norm = False
+                state_dict["no_norm"] = torch.zeros(1)
+    
+            module = SPAN(
+                num_in_ch=num_in_ch,
+                num_out_ch=num_out_ch,
+                feature_channels=feature_channels,
+                upscale=upscale,
+                bias=bias,
+                norm=norm,
+                img_range=img_range,
+                rgb_mean=rgb_mean,
+            )
+            # module.float().cuda().eval()
             scale = 4
         if "conv_first.weight" in state_dict:
             print("Using Spandrel, turning off TRT")
@@ -228,6 +266,8 @@ def realesrgan(
             scale = 1
             trt=False
 
+    # model_name = os.path.basename(model_path)
+    # model_name = os.path.splitext(model_name)[0]
 
     #Set Model Dtype
     if fp16:
@@ -252,19 +292,19 @@ def realesrgan(
     #Load State Dict to Model
     module.load_state_dict(state_dict, strict=True)
 
-    #ESRGAN, 
+    # #ESRGAN, 
     if model == RealESRGANModel.ESRGAN_4x_UltraMix_Balanced:
         print('removing grad')
         for k, v in module.named_parameters():
             v.requires_grad = False
 
-    #Initiate Model to Eval and Send to Cuda
+    # #Initiate Model to Eval and Send to Cuda
     module = module.cuda().eval()
+
+    tmp_module = module
 
     use_denoiser_model = False
     if use_denoiser_model:
-        from spandrel import ModelLoader
-        import spandrel_extra_arches
         spandrel_extra_arches.install()
 
         denoise_model = ModelLoader().load_from_file(r"/workspace/1x_ArtClarity.pth")
@@ -280,8 +320,7 @@ def realesrgan(
         import tensorrt
         
         dtype = torch.float16 if fp16 else torch.float
-        device = torch.device(f"cuda:{device_index}")
-        module = module.to(device=device, dtype=dtype).eval()
+        # module = module.to(device=device, dtype=dtype).eval()
         trt_engine_path = os.path.join(
                 os.path.realpath(trt_cache_dir),
                 (
@@ -290,18 +329,19 @@ def realesrgan(
                     + f"_{'custom_model' if custom_model else ''}"
                     + f"_{pad_w}x{pad_h}"
                     + f"_{'int8' if trt_int8 else 'fp16' if fp16 else 'fp32'}"
-                    + (f"_denoise-{denoise_strength}" if model == RealESRGANModel.realesr_general_x4v3 else "")
                     + f"_{torch.cuda.get_device_name(device)}"
                     + f"_trt-{tensorrt.__version__}"
                     + (f"_workspace-{trt_workspace_size}" if trt_workspace_size > 0 else "")
                     + ".ts"
                 ),
             )
+
         print(f'trt engine path --> {trt_engine_path}')
         if not os.path.isfile(trt_engine_path):
             print('initiating model conversion to trt')
             inputs = [torch.zeros((1, 3, pad_h, pad_w), dtype=dtype, device=device)]
-            module = torch.jit.trace(module, inputs)
+
+            traced_module = torch.jit.trace(module, inputs)
 
             if trt_int8:
                 dataset = torch_tensorrt.ptq.DataLoaderCalibrator(
@@ -322,8 +362,8 @@ def realesrgan(
                         workspace_size=trt_workspace_size,
                     )
             else:
-                module = torch_tensorrt.compile(
-                    module,
+                compiled_module = torch_tensorrt.compile(
+                    traced_module,
                     ir="ts",
                     inputs=inputs,
                     enabled_precisions={torch.float16 if fp16 else torch.float},
@@ -331,11 +371,13 @@ def realesrgan(
                     truncate_long_and_double=True
                 )
 
-            module = torch.jit.script(module)
-            module.save(trt_engine_path)
+            scripted_module = torch.jit.script(compiled_module)
+            scripted_module.save(trt_engine_path)
 
-        module = torch.jit.load(trt_engine_path)
+        loaded_module = torch.jit.load(trt_engine_path)
         backend = Backend.TensorRT(module=module)
+        module = loaded_module
+        print("Using Loaded Module")
     else:
         backend = Backend.Eager(module=module)
 
@@ -390,6 +432,11 @@ def realesrgan(
     frame_idx = 0
     start_time = time.time()
 
+    write_png_file = False
+    if write_png_file:
+        png_dir = os.path.join(os.path.dirname(output_path), "tmpdir")
+        os.makedirs(png_dir, exist_ok=True)
+
     #Inference Loop
     while True:
         frame = read_buffer.get()
@@ -411,7 +458,10 @@ def realesrgan(
                 if use_denoiser_model:
                     output = denoise_model(output)
             output = output.squeeze().permute(1, 2, 0).mul(255.0).clamp(0, 255).byte().cpu().numpy()
-            # cv2.imwrite(f"/workspace/tmpdir/frame_{frame_idx:09d}.png", output)
+            
+            if write_png_file: 
+                cv2.imwrite(os.path.join(png_dir, f"frame_{frame_idx:09d}.png"), output)
+                
         write_buffer.put(output)
         stream_lock[i].release()
 
